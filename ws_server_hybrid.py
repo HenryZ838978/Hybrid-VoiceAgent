@@ -1,14 +1,15 @@
 """
-Hybrid Voice Agent: vLLM MiniCPM-o-4.5 AWQ (audio->text) + VoxCPM TTS (text->audio)
+Hybrid Voice Agent v2 — Production-grade stability rewrite
 
 Architecture:
   Browser <-WSS-> FastAPI (:3001)
-                    |- VAD (Silero, CPU)
-                    |- vLLM API (:8200, GPU 2) - audio understanding + text gen
-                    '- VoxCPM TTS (GPU 1)      - text to speech
+                    |- VAD + State Machine (async, never blocks)
+                    |- vLLM API (:8200) — audio understanding + text gen (HTTP streaming)
+                    '- VoxCPM TTS (thread-isolated) — text to speech
 
-Sentence-level streaming: LLM streams text, each complete sentence is
-immediately sent to TTS while LLM continues generating the rest.
+Key design: TTS runs in a dedicated thread via run_in_executor. The async event
+loop is never blocked by GPU work. Audio is sent in 50ms chunks with cancel
+checks between each, enabling responsive barge-in.
 """
 import os
 import sys
@@ -19,13 +20,11 @@ import base64
 import asyncio
 import logging
 import numpy as np
+from enum import Enum
 
 VOICEAGENT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "voiceagent")
 sys.path.insert(0, VOICEAGENT_DIR)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import nest_asyncio
-nest_asyncio.apply()
 
 import httpx
 import uvicorn
@@ -47,7 +46,18 @@ VOICE_PROMPT_TEXT = "在国内引起了非常大的反响啊，我们也完全�
 SAMPLE_RATE_IN = 16000
 SAMPLE_RATE_OUT = 44100
 CHUNK_SAMPLES = 512
+CHUNK_MS = 32
 PORT = int(os.environ.get("PORT", "3001"))
+
+TTS_SEND_CHUNK_BYTES = 2205 * 2  # ~50ms at 44.1kHz 16-bit
+
+BARGE_IN_VAD_THRESHOLD = 0.85
+BARGE_IN_RMS_THRESHOLD = 0.015
+BARGE_IN_CONFIRM_CHUNKS = 3
+
+ENDPOINT_FAST_CHUNKS = 6     # ~192ms for short utterances (<500ms)
+ENDPOINT_DEFAULT_CHUNKS = 10  # ~320ms for normal
+ENDPOINT_SLOW_CHUNKS = 20    # ~640ms for long utterances (>3s)
 
 SYSTEM_PROMPT = (
     "你是面壁智能的专业客服代表。只使用中文普通话。"
@@ -60,36 +70,73 @@ SENTENCE_RE = re.compile(r'([^。？！?!.]+[。？！?!.])')
 THINK_RE = re.compile(r'<think>.*?</think>', re.DOTALL)
 TAG_RE = re.compile(r'<[^>]+>')
 
+
+class State(Enum):
+    IDLE = "idle"
+    LISTENING = "listening"
+    THINKING = "thinking"
+    SPEAKING = "speaking"
+    INTERRUPTED = "interrupted"
+
+
 engine = {}
 metrics_history = []
 
 
-async def recover_tts():
-    """Recreate TTS engine after crash."""
-    from nanovllm_voxcpm import VoxCPM
-    log.warning("Recovering TTS engine...")
-    try:
-        gpu_idx = int(TTS_DEVICE.split(":")[-1]) if ":" in TTS_DEVICE else 0
-        tts_engine = VoxCPM.from_pretrained(
-            model=TTS_MODEL_DIR, gpu_memory_utilization=0.5, devices=[gpu_idx],
-        )
-        engine["tts_engine"] = tts_engine
-        if os.path.exists(VOICE_PROMPT_WAV):
-            with open(VOICE_PROMPT_WAV, "rb") as f:
-                pid = await tts_engine.add_prompt(f.read(), "wav", VOICE_PROMPT_TEXT)
-            engine["tts_prompt_id"] = pid
-        async for _ in tts_engine.generate(target_text="恢复。", temperature=0.7, cfg_value=3.0):
-            pass
-        log.info("TTS recovered successfully")
-    except Exception as e:
-        log.error("TTS recovery failed: %s", e)
+def _rms(chunk: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(chunk ** 2)))
+
+
+async def _async_tts(text: str) -> list:
+    """Collect all TTS chunks. Runs on the main event loop (nanovllm requirement).
+    Returns list of numpy audio chunks.
+    """
+    tts_engine = engine["tts_engine"]
+    pid = engine.get("tts_prompt_id")
+    kwargs = {"target_text": text, "temperature": 0.7, "cfg_value": 3.0}
+    if pid:
+        kwargs["prompt_id"] = pid
+
+    chunks = []
+    chunk_idx = 0
+    async for audio_chunk in tts_engine.generate(**kwargs):
+        await asyncio.sleep(0)  # yield to event loop between GPU steps
+        if isinstance(audio_chunk, np.ndarray):
+            c = audio_chunk
+        elif hasattr(audio_chunk, 'numpy'):
+            c = audio_chunk.numpy()
+        else:
+            c = np.array(audio_chunk, dtype=np.float32)
+
+        chunk_idx += 1
+        if chunk_idx == 1:
+            continue
+        if chunk_idx == 2:
+            fade = int(SAMPLE_RATE_OUT * 0.01)
+            if len(c) > fade:
+                c[:fade] *= np.linspace(0, 1, fade, dtype=c.dtype)
+        chunks.append(c)
+    return chunks
+
+
+def _sync_tts_via_main_loop(text: str) -> list:
+    """Thread-callable wrapper: schedules TTS on the main event loop, blocks until done."""
+    main_loop = engine["main_loop"]
+    future = asyncio.run_coroutine_threadsafe(_async_tts(text), main_loop)
+    return future.result(timeout=30)
+
+
+def clean_text(text):
+    text = THINK_RE.sub('', text)
+    text = TAG_RE.sub('', text)
+    return text.strip()
 
 
 async def load_engines():
     from engine.vad import SileroVAD
     from nanovllm_voxcpm import VoxCPM
 
-    log.info("=== Loading Hybrid Agent engines ===")
+    log.info("=== Loading Hybrid Agent v2 engines ===")
 
     log.info("Loading VAD...")
     vad = SileroVAD(VAD_MODEL_DIR, threshold=0.5)
@@ -99,9 +146,7 @@ async def load_engines():
     log.info("Loading VoxCPM TTS on %s ...", TTS_DEVICE)
     gpu_idx = int(TTS_DEVICE.split(":")[-1]) if ":" in TTS_DEVICE else 0
     tts_engine = VoxCPM.from_pretrained(
-        model=TTS_MODEL_DIR,
-        gpu_memory_utilization=0.5,
-        devices=[gpu_idx],
+        model=TTS_MODEL_DIR, gpu_memory_utilization=0.5, devices=[gpu_idx],
     )
     engine["tts_engine"] = tts_engine
     engine["tts_prompt_id"] = None
@@ -109,21 +154,21 @@ async def load_engines():
     if os.path.exists(VOICE_PROMPT_WAV):
         log.info("Registering voice clone...")
         with open(VOICE_PROMPT_WAV, "rb") as f:
-            wav_bytes = f.read()
-        pid = await tts_engine.add_prompt(wav_bytes, "wav", VOICE_PROMPT_TEXT)
+            pid = await tts_engine.add_prompt(f.read(), "wav", VOICE_PROMPT_TEXT)
         engine["tts_prompt_id"] = pid
         log.info("Voice clone registered: %s", pid)
 
+    engine["main_loop"] = asyncio.get_event_loop()
+
     log.info("Warming up TTS...")
-    async for _ in tts_engine.generate(target_text="你好。", temperature=0.7, cfg_value=3.0):
-        pass
+    await _async_tts("你好，欢迎致电。")
     log.info("TTS warm.")
 
     log.info("vLLM endpoint: %s (model: %s)", VLLM_BASE, VLLM_MODEL)
-    log.info("=== All engines loaded ===")
+    log.info("=== All engines loaded (v2) ===")
 
 
-app = FastAPI(title="Hybrid Voice Agent (vLLM Omni + VoxCPM TTS)")
+app = FastAPI(title="Hybrid Voice Agent v2")
 
 
 @app.on_event("startup")
@@ -139,11 +184,10 @@ async def index():
 @app.get("/api/info")
 async def api_info():
     return {
-        "architecture": "hybrid: vLLM MiniCPM-o-4.5 AWQ (audio->text) + VoxCPM TTS (text->audio)",
+        "architecture": "hybrid v2: vLLM MiniCPM-o-4.5 AWQ + VoxCPM TTS (thread-isolated)",
         "vllm_model": VLLM_MODEL,
         "vllm_endpoint": VLLM_BASE,
-        "tts": "VoxCPM 1.5",
-        "tts_device": TTS_DEVICE,
+        "tts": "VoxCPM 1.5 (thread-isolated)",
         "sample_rate_out": SAMPLE_RATE_OUT,
     }
 
@@ -153,14 +197,7 @@ async def api_metrics():
     return {"history": metrics_history[-50:]}
 
 
-def clean_text(text):
-    text = THINK_RE.sub('', text)
-    text = TAG_RE.sub('', text)
-    return text.strip()
-
-
 async def stream_vllm_text(audio_b64: str):
-    """Stream text tokens from vLLM given base64 audio."""
     payload = {
         "model": VLLM_MODEL,
         "messages": [
@@ -185,43 +222,19 @@ async def stream_vllm_text(audio_b64: str):
                     yield delta
 
 
-async def tts_synthesize_chunks(text: str, cancel_event=None):
-    """Generate TTS audio chunks. MUST fully consume the generator (nanovllm requirement).
-    On cancel: continues draining but stops yielding. asyncio.sleep(0) prevents event loop starvation.
-    """
-    tts_engine = engine["tts_engine"]
-    pid = engine.get("tts_prompt_id")
-    kwargs = {"target_text": text, "temperature": 0.7, "cfg_value": 3.0}
-    if pid:
-        kwargs["prompt_id"] = pid
-
-    chunk_idx = 0
-    try:
-        async for audio_chunk in tts_engine.generate(**kwargs):
-            await asyncio.sleep(0)  # yield to event loop (critical for WS keepalive)
-
-            if isinstance(audio_chunk, np.ndarray):
-                c = audio_chunk
-            elif hasattr(audio_chunk, 'numpy'):
-                c = audio_chunk.numpy()
-            else:
-                c = np.array(audio_chunk, dtype=np.float32)
-
-            chunk_idx += 1
-            if chunk_idx == 1:
-                continue
-            if chunk_idx == 2:
-                fade = int(SAMPLE_RATE_OUT * 0.01)
-                if len(c) > fade:
-                    c[:fade] *= np.linspace(0, 1, fade, dtype=c.dtype)
-
-            if cancel_event and cancel_event.is_set():
-                continue  # drain without yielding
-
-            yield c
-    except Exception as e:
-        log.error("TTS generation error: %s", e)
-        await recover_tts()
+async def send_audio_chunked(ws: WebSocket, audio: np.ndarray, cancel: asyncio.Event):
+    """Send audio in 50ms chunks with cancel check between each."""
+    if audio.dtype != np.int16:
+        audio = (np.clip(audio, -1, 1) * 32767).astype(np.int16)
+    audio_bytes = audio.tobytes()
+    for i in range(0, len(audio_bytes), TTS_SEND_CHUNK_BYTES):
+        if cancel.is_set():
+            return
+        try:
+            await ws.send_bytes(audio_bytes[i:i + TTS_SEND_CHUNK_BYTES])
+        except Exception:
+            return
+        await asyncio.sleep(0.002)
 
 
 @app.websocket("/ws/voice")
@@ -233,27 +246,40 @@ async def ws_voice(ws: WebSocket):
     vad = SileroVAD(VAD_MODEL_DIR, threshold=0.5)
     vad.load()
 
-    state = "idle"
+    state = State.IDLE
     audio_buffer = []
-    speech_chunks = 0
+    silence_count = 0
+    turn = 0
     cancel = asyncio.Event()
     barge_confirm = 0
+    speaking_task = None
 
     async def send_json(d):
-        try: await ws.send_json(d)
-        except: pass
+        try:
+            await ws.send_json(d)
+        except Exception:
+            pass
 
-    async def set_state(s):
-        nonlocal state; state = s
-        await send_json({"type": "state", "state": s})
-
-    async def handle_speech(audio_np):
+    async def set_state(s: State):
         nonlocal state
+        state = s
+        await send_json({"type": "state", "state": s.value})
+
+    def adaptive_endpoint_threshold() -> int:
+        dur_ms = len(audio_buffer) * CHUNK_MS
+        if dur_ms < 500:
+            return ENDPOINT_FAST_CHUNKS
+        elif dur_ms > 3000:
+            return ENDPOINT_SLOW_CHUNKS
+        return ENDPOINT_DEFAULT_CHUNKS
+
+    async def run_pipeline(audio_np: np.ndarray, current_turn: int):
+        nonlocal state
+        loop = asyncio.get_event_loop()
         t_start = time.perf_counter()
 
-        await set_state("thinking")
-        audio_dur = len(audio_np) / SAMPLE_RATE_IN
-        await send_json({"type": "processing", "audio_duration_s": round(audio_dur, 2)})
+        await set_state(State.THINKING)
+        await send_json({"type": "processing", "audio_duration_s": round(len(audio_np) / SAMPLE_RATE_IN, 2)})
 
         import soundfile as sf, io
         buf = io.BytesIO()
@@ -265,17 +291,17 @@ async def ws_voice(ws: WebSocket):
         sentence_buf = ""
         tts_started = False
         tts_ttfa = None
+        sentence_count = 0
 
         async for token in stream_vllm_text(audio_b64):
             if cancel.is_set():
-                log.info("Cancel during LLM stream — aborting turn")
+                log.info("[Turn %d] Cancel during LLM stream", current_turn)
                 break
             if llm_ttft is None:
                 llm_ttft = (time.perf_counter() - t_start) * 1000
 
             full_text += token
-            cleaned = clean_text(token)
-            sentence_buf += cleaned
+            sentence_buf += clean_text(token)
 
             sentences = SENTENCE_RE.findall(sentence_buf)
             if sentences:
@@ -288,44 +314,42 @@ async def ws_voice(ws: WebSocket):
                         continue
 
                     if not tts_started:
-                        await set_state("speaking")
+                        cancel.clear()
+                        await set_state(State.SPEAKING)
                         await send_json({"type": "audio_start", "sample_rate": SAMPLE_RATE_OUT})
                         tts_started = True
 
                     t_tts = time.perf_counter()
-                    sent_chunks = 0
-                    async for c in tts_synthesize_chunks(sent, cancel):
-                        if cancel.is_set():
-                            continue
-                        if tts_ttfa is None:
-                            tts_ttfa = (time.perf_counter() - t_tts) * 1000
-                        c16 = (c * 32767).clip(-32768, 32767).astype(np.int16)
-                        sent_chunks += 1
-                        try:
-                            await ws.send_bytes(c16.tobytes())
-                        except Exception as e:
-                            log.error("send_bytes failed at chunk %d: %s", sent_chunks, e)
-                            break
-                    log.info("TTS sent %d chunks for: '%s' (%.0fms)", sent_chunks, sent[:20], (time.perf_counter()-t_tts)*1000)
+                    tts_chunks = await _async_tts(sent)
+                    sentence_count += 1
+
+                    if tts_ttfa is None and tts_chunks:
+                        tts_ttfa = (time.perf_counter() - t_tts) * 1000
+
+                    if tts_chunks and not cancel.is_set():
+                        audio_out = np.concatenate(tts_chunks)
+                        log.info("[Turn %d] TTS sent %d chunks for: '%s'",
+                                 current_turn, len(tts_chunks), sent[:30])
+                        await send_audio_chunked(ws, audio_out, cancel)
 
         remaining = clean_text(sentence_buf).strip()
         if remaining and len(remaining) >= 2 and not cancel.is_set():
             if not tts_started:
-                await set_state("speaking")
+                cancel.clear()
+                await set_state(State.SPEAKING)
                 await send_json({"type": "audio_start", "sample_rate": SAMPLE_RATE_OUT})
                 tts_started = True
 
             t_tts = time.perf_counter()
-            async for c in tts_synthesize_chunks(remaining, cancel):
-                if cancel.is_set():
-                    continue
-                if tts_ttfa is None:
-                    tts_ttfa = (time.perf_counter() - t_tts) * 1000
-                c16 = (c * 32767).clip(-32768, 32767).astype(np.int16)
-                try:
-                    await ws.send_bytes(c16.tobytes())
-                except:
-                    break
+            tts_chunks = await _async_tts(remaining)
+            sentence_count += 1
+            if tts_ttfa is None and tts_chunks:
+                tts_ttfa = (time.perf_counter() - t_tts) * 1000
+            if tts_chunks and not cancel.is_set():
+                audio_out = np.concatenate(tts_chunks)
+                log.info("[Turn %d] TTS sent %d chunks for: '%s'",
+                         current_turn, len(tts_chunks), remaining[:30])
+                await send_audio_chunked(ws, audio_out, cancel)
 
         total_ms = (time.perf_counter() - t_start) * 1000
         clean_full = clean_text(full_text).strip()
@@ -341,31 +365,26 @@ async def ws_voice(ws: WebSocket):
         metrics_history.append(m)
 
         await send_json({
-            "type": "response",
-            "text": clean_full,
-            "llm_ttft_ms": m["llm_ttft_ms"],
-            "tts_ttfa_ms": m["tts_ttfa_ms"],
-            "total_ms": m["total_ms"],
-            "first_audio_ms": m["first_audio_ms"],
+            "type": "response", "text": clean_full,
+            "llm_ttft_ms": m["llm_ttft_ms"], "tts_ttfa_ms": m["tts_ttfa_ms"],
+            "total_ms": m["total_ms"], "first_audio_ms": m["first_audio_ms"],
         })
         await send_json({"type": "audio_end", "total_ms": m["total_ms"]})
 
-        if not cancel.is_set():
-            await set_state("idle")
-        else:
-            log.info("Turn cancelled, resetting to idle")
-            await set_state("idle")
+        if state == State.SPEAKING:
+            await set_state(State.IDLE)
+        elif state == State.INTERRUPTED:
+            log.info("[Turn %d] Pipeline done while interrupted, staying in INTERRUPTED", current_turn)
 
-    async def safe_handle_speech(audio_np):
+    async def safe_pipeline(audio_np, current_turn):
         try:
-            await handle_speech(audio_np)
+            await run_pipeline(audio_np, current_turn)
         except Exception as e:
-            log.error("handle_speech error: %s", e, exc_info=True)
-            await set_state("idle")
+            log.error("[Turn %d] Pipeline error: %s", current_turn, e, exc_info=True)
+            await set_state(State.IDLE)
 
-    speaking_task = None
     try:
-        await set_state("idle")
+        await set_state(State.IDLE)
         while True:
             data = await ws.receive()
             if data.get("type") == "websocket.disconnect":
@@ -378,44 +397,81 @@ async def ws_voice(ws: WebSocket):
                     if len(chunk) < CHUNK_SAMPLES:
                         chunk = np.pad(chunk, (0, CHUNK_SAMPLES - len(chunk)))
 
-                    ev = vad.process_chunk(chunk)
-                    rms = float(np.sqrt(np.mean(chunk ** 2)))
+                    vad_result = vad.process_chunk(chunk)
+                    speech_prob = vad_result["speech_prob"]
+                    is_speech = speech_prob >= 0.5
+                    rms = _rms(chunk)
 
-                    if state == "speaking":
-                        is_real = ev["speech_prob"] >= 0.85 and rms > 0.015
+                    # --- IDLE ---
+                    if state == State.IDLE:
+                        if is_speech and rms > 0.01:
+                            audio_buffer.clear()
+                            audio_buffer.append(chunk.copy())
+                            silence_count = 0
+                            await set_state(State.LISTENING)
+
+                    # --- LISTENING ---
+                    elif state == State.LISTENING:
+                        audio_buffer.append(chunk.copy())
+                        if is_speech:
+                            silence_count = 0
+                        else:
+                            silence_count += 1
+                            if silence_count >= adaptive_endpoint_threshold():
+                                if len(audio_buffer) >= 6:
+                                    turn += 1
+                                    full_audio = np.concatenate(audio_buffer)
+                                    audio_buffer.clear()
+                                    silence_count = 0
+                                    cancel.clear()
+                                    barge_confirm = 0
+                                    speaking_task = asyncio.create_task(safe_pipeline(full_audio, turn))
+                                else:
+                                    audio_buffer.clear()
+                                    silence_count = 0
+                                    await set_state(State.IDLE)
+
+                    # --- SPEAKING ---
+                    elif state == State.SPEAKING:
+                        is_real = speech_prob >= BARGE_IN_VAD_THRESHOLD and rms > BARGE_IN_RMS_THRESHOLD
                         if is_real:
                             barge_confirm += 1
-                            if barge_confirm >= 3:
-                                log.info("Barge-in confirmed (3 chunks, prob=%.2f, rms=%.3f)",
-                                         ev["speech_prob"], rms)
+                            if barge_confirm >= BARGE_IN_CONFIRM_CHUNKS:
+                                log.info("Barge-in confirmed (prob=%.2f, rms=%.3f)", speech_prob, rms)
                                 cancel.set()
                                 barge_confirm = 0
-                                await send_json({"type": "barge_in"})
                                 audio_buffer.clear()
-                                speech_chunks = 0
-                                await set_state("listening")
+                                audio_buffer.append(chunk.copy())
+                                silence_count = 0
+                                await send_json({"type": "barge_in"})
+                                await set_state(State.INTERRUPTED)
                         else:
                             barge_confirm = 0
-                    elif ev["speech_start"]:
-                        audio_buffer.clear()
-                        speech_chunks = 0
-                        await set_state("listening")
 
-                    if state == "listening":
+                    # --- INTERRUPTED ---
+                    elif state == State.INTERRUPTED:
                         audio_buffer.append(chunk.copy())
-                        speech_chunks += 1
-
-                    if ev["speech_end"] and state == "listening":
-                        if speech_chunks >= 10:
-                            full_audio = np.concatenate(audio_buffer)
-                            audio_buffer.clear()
-                            speech_chunks = 0
-                            cancel.clear()
-                            speaking_task = asyncio.create_task(safe_handle_speech(full_audio))
+                        if is_speech:
+                            silence_count = 0
                         else:
-                            audio_buffer.clear()
-                            speech_chunks = 0
-                            await set_state("idle")
+                            silence_count += 1
+                            if silence_count >= 10:
+                                if len(audio_buffer) >= 6:
+                                    turn += 1
+                                    full_audio = np.concatenate(audio_buffer)
+                                    audio_buffer.clear()
+                                    silence_count = 0
+                                    cancel.clear()
+                                    barge_confirm = 0
+                                    speaking_task = asyncio.create_task(safe_pipeline(full_audio, turn))
+                                else:
+                                    audio_buffer.clear()
+                                    silence_count = 0
+                                    await set_state(State.IDLE)
+
+                    # --- THINKING ---
+                    elif state == State.THINKING:
+                        pass  # ignore audio while processing
 
             elif "text" in data and data["text"]:
                 try:
@@ -426,7 +482,10 @@ async def ws_voice(ws: WebSocket):
                     cancel.set()
                     vad.reset()
                     audio_buffer.clear()
-                    await set_state("idle")
+                    silence_count = 0
+                    barge_confirm = 0
+                    turn = 0
+                    await set_state(State.IDLE)
 
     except WebSocketDisconnect:
         log.info("Disconnected")
