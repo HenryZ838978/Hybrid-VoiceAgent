@@ -43,13 +43,19 @@ VAD_MODEL_DIR = os.path.join(VOICEAGENT_DIR, "models", "snakers4_silero-vad")
 VOICE_PROMPT_WAV = os.path.join(VOICEAGENT_DIR, "data", "voice_prompt.wav")
 VOICE_PROMPT_TEXT = "在国内引起了非常大的反响啊，我们也完全没有想到我们的这个工作会以这种方式出圈。"
 
+EMBED_MODEL_DIR = os.path.join(VOICEAGENT_DIR, "models", "bge-small-zh-v1.5")
+KB_DATA_PATH = os.path.join(VOICEAGENT_DIR, "data", "sample_kb.json")
+RAG_DEVICE = os.environ.get("RAG_DEVICE", "cpu")
+RAG_TOP_K = 3
+MAX_HISTORY_TURNS = 8
+
 SAMPLE_RATE_IN = 16000
 SAMPLE_RATE_OUT = 44100
 CHUNK_SAMPLES = 512
 CHUNK_MS = 32
 PORT = int(os.environ.get("PORT", "3001"))
 
-TTS_SEND_CHUNK_BYTES = 2205 * 2  # ~50ms at 44.1kHz 16-bit
+TTS_SEND_CHUNK_BYTES = 8820 * 2  # ~200ms at 44.1kHz 16-bit (larger = smoother over network)
 
 BARGE_IN_VAD_THRESHOLD = 0.85
 BARGE_IN_RMS_THRESHOLD = 0.015
@@ -59,16 +65,22 @@ ENDPOINT_FAST_CHUNKS = 6     # ~192ms for short utterances (<500ms)
 ENDPOINT_DEFAULT_CHUNKS = 10  # ~320ms for normal
 ENDPOINT_SLOW_CHUNKS = 20    # ~640ms for long utterances (>3s)
 
-SYSTEM_PROMPT = (
+SYSTEM_PROMPT_BASE = (
     "你是面壁智能的专业客服代表。只使用中文普通话。"
     "语气友好、专业、沉稳，像资深客服人员。"
     "回答简洁准确，每次1-2句话。不要用编号和列举。"
-    "不要使用任何XML标签。"
+    "不要使用任何XML标签。不要复述用户的话。直接回答问题。"
+)
+
+SYSTEM_PROMPT_RAG = (
+    "{base}\n\n以下是知识库，优先根据知识库内容回答。如果知识库没有相关信息，坦诚告知。"
+    "\n\n知识库：\n{context}"
 )
 
 SENTENCE_RE = re.compile(r'([^。？！?!.]+[。？！?!.])')
 THINK_RE = re.compile(r'<think>.*?</think>', re.DOTALL)
 TAG_RE = re.compile(r'<[^>]+>')
+HEARD_RE = re.compile(r'\[听到[】\]][^\n]*[\n]?')
 
 
 class State(Enum):
@@ -116,6 +128,16 @@ async def _async_tts(text: str) -> list:
             if len(c) > fade:
                 c[:fade] *= np.linspace(0, 1, fade, dtype=c.dtype)
         chunks.append(c)
+
+    # Cross-fade between TTS chunks to eliminate boundary clicks
+    if len(chunks) > 1:
+        xfade = min(441, min(len(c) for c in chunks))  # ~10ms at 44.1kHz
+        for i in range(1, len(chunks)):
+            fade_out = np.linspace(1, 0, xfade, dtype=np.float32)
+            fade_in = np.linspace(0, 1, xfade, dtype=np.float32)
+            chunks[i - 1][-xfade:] *= fade_out
+            chunks[i][:xfade] *= fade_in
+
     return chunks
 
 
@@ -129,6 +151,7 @@ def _sync_tts_via_main_loop(text: str) -> list:
 def clean_text(text):
     text = THINK_RE.sub('', text)
     text = TAG_RE.sub('', text)
+    text = HEARD_RE.sub('', text)
     return text.strip()
 
 
@@ -164,8 +187,26 @@ async def load_engines():
     await _async_tts("你好，欢迎致电。")
     log.info("TTS warm.")
 
+    log.info("Loading RAG (bge-small-zh-v1.5)...")
+    if os.path.isdir(EMBED_MODEL_DIR) and os.path.exists(KB_DATA_PATH):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("rag", os.path.join(VOICEAGENT_DIR, "engine", "rag.py"))
+        rag_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rag_mod)
+        rag = rag_mod.RAGEngine(EMBED_MODEL_DIR, device=RAG_DEVICE, top_k=RAG_TOP_K)
+        rag.load()
+        with open(KB_DATA_PATH, "r", encoding="utf-8") as f:
+            import json as _json
+            docs = _json.load(f)
+        info = rag.build_index(docs)
+        engine["rag"] = rag
+        log.info("RAG: %d docs, dim=%d, embed=%.1fms", info["num_docs"], info["dim"], info["encode_ms"])
+    else:
+        engine["rag"] = None
+        log.info("RAG: skipped (model or KB not found)")
+
     log.info("vLLM endpoint: %s (model: %s)", VLLM_BASE, VLLM_MODEL)
-    log.info("=== All engines loaded (v2) ===")
+    log.info("=== All engines loaded (v2.1) ===")
 
 
 app = FastAPI(title="Hybrid Voice Agent v2")
@@ -197,15 +238,17 @@ async def api_metrics():
     return {"history": metrics_history[-50:]}
 
 
-async def stream_vllm_text(audio_b64: str):
+async def stream_vllm_text(audio_b64: str, history: list, system_prompt: str):
+    """Stream text from vLLM with multi-turn history + current audio."""
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": [
+        {"type": "audio_url", "audio_url": {"url": f"data:audio/wav;base64,{audio_b64}"}}
+    ]})
+
     payload = {
         "model": VLLM_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": [
-                {"type": "audio_url", "audio_url": {"url": f"data:audio/wav;base64,{audio_b64}"}}
-            ]},
-        ],
+        "messages": messages,
         "max_tokens": 256,
         "temperature": 0.7,
         "stream": True,
@@ -234,7 +277,7 @@ async def send_audio_chunked(ws: WebSocket, audio: np.ndarray, cancel: asyncio.E
             await ws.send_bytes(audio_bytes[i:i + TTS_SEND_CHUNK_BYTES])
         except Exception:
             return
-        await asyncio.sleep(0.002)
+        await asyncio.sleep(0)
 
 
 @app.websocket("/ws/voice")
@@ -253,6 +296,7 @@ async def ws_voice(ws: WebSocket):
     cancel = asyncio.Event()
     barge_confirm = 0
     speaking_task = None
+    conversation_history = []  # list of {"role": "user"/"assistant", "content": str}
 
     async def send_json(d):
         try:
@@ -286,6 +330,24 @@ async def ws_voice(ws: WebSocket):
         sf.write(buf, audio_np, SAMPLE_RATE_IN, format='WAV', subtype='PCM_16')
         audio_b64 = base64.b64encode(buf.getvalue()).decode()
 
+        rag = engine.get("rag")
+        rag_context = ""
+        rag_ms = 0
+        if rag and conversation_history:
+            last_ai = next((m["content"] for m in reversed(conversation_history) if m["role"] == "assistant"), "")
+            query = last_ai
+            if query:
+                t_rag = time.perf_counter()
+                rag_result = await loop.run_in_executor(None, rag.get_context, query)
+                rag_context = rag_result["context"]
+                rag_ms = rag_result["total_ms"]
+                await send_json({"type": "rag", "context": rag_context, "latency_ms": round(rag_ms, 1)})
+
+        if rag_context:
+            sys_prompt = SYSTEM_PROMPT_RAG.format(base=SYSTEM_PROMPT_BASE, context=rag_context)
+        else:
+            sys_prompt = SYSTEM_PROMPT_BASE
+
         llm_ttft = None
         full_text = ""
         sentence_buf = ""
@@ -293,7 +355,7 @@ async def ws_voice(ws: WebSocket):
         tts_ttfa = None
         sentence_count = 0
 
-        async for token in stream_vllm_text(audio_b64):
+        async for token in stream_vllm_text(audio_b64, conversation_history, sys_prompt):
             if cancel.is_set():
                 log.info("[Turn %d] Cancel during LLM stream", current_turn)
                 break
@@ -352,22 +414,35 @@ async def ws_voice(ws: WebSocket):
                 await send_audio_chunked(ws, audio_out, cancel)
 
         total_ms = (time.perf_counter() - t_start) * 1000
-        clean_full = clean_text(full_text).strip()
+
+        ai_response = clean_text(full_text).strip()
+
+        if ai_response:
+            conversation_history.append({"role": "user", "content": "(audio)"})
+            conversation_history.append({"role": "assistant", "content": ai_response})
+        while len(conversation_history) > MAX_HISTORY_TURNS * 2:
+            conversation_history.pop(0)
+
+        log.info("[Turn %d] History: ai='%s' (total %d msgs)",
+                 current_turn, ai_response[:40], len(conversation_history))
 
         m = {
             "llm_ttft_ms": round(llm_ttft or 0, 1),
             "tts_ttfa_ms": round(tts_ttfa or 0, 1),
+            "rag_ms": round(rag_ms, 1),
             "total_ms": round(total_ms, 1),
             "first_audio_ms": round((llm_ttft or 0) + (tts_ttfa or 0), 1),
-            "text": clean_full,
+            "text": ai_response,
             "timestamp": time.time(),
         }
         metrics_history.append(m)
 
         await send_json({
-            "type": "response", "text": clean_full,
+            "type": "response", "text": ai_response,
             "llm_ttft_ms": m["llm_ttft_ms"], "tts_ttfa_ms": m["tts_ttfa_ms"],
-            "total_ms": m["total_ms"], "first_audio_ms": m["first_audio_ms"],
+            "rag_ms": m["rag_ms"], "total_ms": m["total_ms"],
+            "first_audio_ms": m["first_audio_ms"],
+            "history_len": len(conversation_history),
         })
         await send_json({"type": "audio_end", "total_ms": m["total_ms"]})
 
@@ -482,10 +557,12 @@ async def ws_voice(ws: WebSocket):
                     cancel.set()
                     vad.reset()
                     audio_buffer.clear()
+                    conversation_history.clear()
                     silence_count = 0
                     barge_confirm = 0
                     turn = 0
                     await set_state(State.IDLE)
+                    log.info("Session reset (history cleared)")
 
     except WebSocketDisconnect:
         log.info("Disconnected")

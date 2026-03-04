@@ -298,9 +298,14 @@ function connectWS() {
         var fa = msg.first_audio_ms || msg.ttfa_ms || 0;
         var llm = msg.llm_ttft_ms || 0;
         var tts = msg.tts_ttfa_ms || 0;
+        
         addMsg('assistant', msg.text,
-          'LLM ' + Math.round(llm) + 'ms + TTS ' + Math.round(tts) + 'ms = ' + Math.round(fa) + 'ms first audio');
+          'LLM ' + Math.round(llm) + 'ms + TTS ' + Math.round(tts) + 'ms = ' + Math.round(fa) + 'ms'
+          + (msg.rag_ms > 0 ? ' | RAG ' + Math.round(msg.rag_ms) + 'ms' : '')
+          + (msg.history_len ? ' | ctx ' + msg.history_len : ''));
         updateMetrics(fa, msg.total_ms || 0, llm, tts);
+        break;
+      case 'rag':
         break;
       case 'audio_end':
         break;
@@ -380,8 +385,7 @@ function toggleCall() {
         var src = capCtx.createMediaStreamSource(stream);
         workletNode = new AudioWorkletNode(capCtx, 'p');
         workletNode.port.onmessage = function(e) {
-          var shouldSend = agentState !== 'speaking';
-          if (ws && ws.readyState === 1 && shouldSend) ws.send(e.data);
+          if (ws && ws.readyState === 1) ws.send(e.data);
           var arr = new Int16Array(e.data);
           var sum = 0; for (var i = 0; i < arr.length; i++) sum += Math.abs(arr[i]);
           $('vuBar').style.width = Math.min(100, (sum / arr.length / 32768) * 300) + '%';
