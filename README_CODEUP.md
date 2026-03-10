@@ -247,7 +247,8 @@ CUDA_VISIBLE_DEVICES=1 TTS_DEVICE=cuda:0 PORT=3001 python ws_server_hybrid.py
 | v1.0 | 2026-03-04 | 基础 vLLM + VoxCPM 混合 pipeline |
 | v2.0 | 2026-03-04 | 5 状态机 + 鲁棒打断 + 自适应 endpointing |
 | v2.1 | 2026-03-05 | 多轮上下文 + RAG + TTS 调优 (temp=0.9) |
-| **v3.0** | **2026-03-05** | **LLM 线程解耦 + Speaker VAD + 打断聚合** |
+| v3.0 | 2026-03-05 | LLM 线程解耦 + Speaker VAD + 打断聚合 |
+| **v3.1** | **2026-03-10** | **流式 TTS + 事件循环呼吸 + Turn 序列号过滤** |
 
 ---
 
