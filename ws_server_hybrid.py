@@ -111,38 +111,64 @@ def clean_text(text):
     return text.strip()
 
 
-async def _async_tts(text: str) -> list:
+async def _async_tts_stream(text: str, ws: WebSocket, cancel: asyncio.Event, turn: int):
+    """Streaming TTS: generate and send each chunk immediately.
+    Returns (ttfa_ms, chunk_count). Checks cancel between every chunk.
+    """
     tts_engine = engine["tts_engine"]
     pid = engine.get("tts_prompt_id")
     kwargs = {"target_text": text, "temperature": 0.9, "cfg_value": 3.0}
     if pid:
         kwargs["prompt_id"] = pid
 
-    chunks = []
+    t0 = time.perf_counter()
+    ttfa = None
     chunk_idx = 0
+    sent_count = 0
+    prev_tail = None
+
     async for audio_chunk in tts_engine.generate(**kwargs):
         await asyncio.sleep(0)
+        if cancel.is_set():
+            continue  # must drain nanovllm generator fully
+
         if isinstance(audio_chunk, np.ndarray):
             c = audio_chunk
         elif hasattr(audio_chunk, 'numpy'):
             c = audio_chunk.numpy()
         else:
             c = np.array(audio_chunk, dtype=np.float32)
+
         chunk_idx += 1
         if chunk_idx == 1:
-            continue
+            ttfa = (time.perf_counter() - t0) * 1000
+            continue  # skip VAE startup transient
+
         if chunk_idx == 2:
             fade = int(SAMPLE_RATE_OUT * 0.01)
             if len(c) > fade:
                 c[:fade] *= np.linspace(0, 1, fade, dtype=c.dtype)
-        chunks.append(c)
 
-    if len(chunks) > 1:
-        xfade = min(441, min(len(c) for c in chunks))
-        for i in range(1, len(chunks)):
-            chunks[i - 1][-xfade:] *= np.linspace(1, 0, xfade, dtype=np.float32)
-            chunks[i][:xfade] *= np.linspace(0, 1, xfade, dtype=np.float32)
-    return chunks
+        # Cross-fade with previous chunk tail
+        if prev_tail is not None and len(c) > len(prev_tail):
+            c[:len(prev_tail)] = c[:len(prev_tail)] * 0.5 + prev_tail * 0.5
+
+        xfade = min(441, len(c))
+        prev_tail = c[-xfade:].copy() * np.linspace(1, 0, xfade, dtype=np.float32)
+        c[-xfade:] *= np.linspace(1, 0.7, xfade, dtype=np.float32)
+
+        if cancel.is_set():
+            continue
+
+        c16 = (c * 32767).clip(-32768, 32767).astype(np.int16)
+        try:
+            await ws.send_bytes(c16.tobytes())
+            sent_count += 1
+        except Exception:
+            break
+        await asyncio.sleep(0.05)  # breathing room for event loop
+
+    return ttfa or 0, sent_count
 
 
 def _sync_llm_stream(audio_b64: str, history: list, system_prompt: str,
@@ -234,8 +260,9 @@ async def load_engines():
 
     log.info("Loading VoxCPM TTS on %s ...", TTS_DEVICE)
     gpu_idx = int(TTS_DEVICE.split(":")[-1]) if ":" in TTS_DEVICE else 0
+    tts_mem = float(os.environ.get("TTS_GPU_MEM", "0.35"))
     tts_engine = VoxCPM.from_pretrained(
-        model=TTS_MODEL_DIR, gpu_memory_utilization=0.5, devices=[gpu_idx],
+        model=TTS_MODEL_DIR, gpu_memory_utilization=tts_mem, devices=[gpu_idx],
     )
     engine["tts_engine"] = tts_engine
     engine["tts_prompt_id"] = None
@@ -249,7 +276,13 @@ async def load_engines():
 
     engine["main_loop"] = asyncio.get_event_loop()
     log.info("Warming up TTS...")
-    await _async_tts("你好，欢迎致电。")
+    tts_engine_ref = engine["tts_engine"]
+    pid_ref = engine.get("tts_prompt_id")
+    wkw = {"target_text": "你好，欢迎致电。", "temperature": 0.9, "cfg_value": 3.0}
+    if pid_ref:
+        wkw["prompt_id"] = pid_ref
+    async for _ in tts_engine_ref.generate(**wkw):
+        pass
     log.info("TTS warm.")
 
     log.info("Loading RAG...")
@@ -312,7 +345,7 @@ async def send_audio_chunked(ws, audio, cancel):
             await ws.send_bytes(audio_bytes[i:i + TTS_SEND_CHUNK_BYTES])
         except Exception:
             return
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.05)
 
 
 @app.websocket("/ws/voice")
@@ -437,21 +470,15 @@ async def ws_voice(ws: WebSocket):
 
             if not tts_started:
                 await set_state(State.SPEAKING)
-                await send_json({"type": "audio_start", "sample_rate": SAMPLE_RATE_OUT})
+                await send_json({"type": "audio_start", "sample_rate": SAMPLE_RATE_OUT, "turn": current_turn})
                 tts_started = True
 
-            t_tts = time.perf_counter()
-            tts_chunks = await _async_tts(sent)
             sentence_count += 1
             full_text += sent
-
-            if tts_ttfa is None and tts_chunks:
-                tts_ttfa = (time.perf_counter() - t_tts) * 1000
-
-            if tts_chunks and not cancel.is_set():
-                audio_out = np.concatenate(tts_chunks)
-                log.info("[Turn %d] TTS: '%s' (%d chunks)", current_turn, sent[:25], len(tts_chunks))
-                await send_audio_chunked(ws, audio_out, cancel)
+            chunk_ttfa, chunk_count = await _async_tts_stream(sent, ws, cancel, current_turn)
+            if tts_ttfa is None and chunk_ttfa > 0:
+                tts_ttfa = chunk_ttfa
+            log.info("[Turn %d] TTS streamed: '%s' (%d chunks)", current_turn, sent[:25], chunk_count)
 
         # Merge late speech from THINKING
         if thinking_has_speech and thinking_buffer:
@@ -492,7 +519,7 @@ async def ws_voice(ws: WebSocket):
         })
         await send_json({"type": "audio_end", "total_ms": m["total_ms"]})
 
-        if state == State.SPEAKING:
+        if state in (State.SPEAKING, State.THINKING):
             await set_state(State.IDLE)
 
     async def safe_pipeline(audio_np, current_turn):
@@ -565,7 +592,7 @@ async def ws_voice(ws: WebSocket):
                                 audio_buffer.clear()
                                 audio_buffer.append(chunk.copy())
                                 silence_count = 0
-                                await send_json({"type": "barge_in"})
+                                await send_json({"type": "barge_in", "turn": turn})
                                 await set_state(State.INTERRUPTED)
                         else:
                             barge_confirm = 0

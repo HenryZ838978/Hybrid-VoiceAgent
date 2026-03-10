@@ -114,6 +114,7 @@ body { font-family: -apple-system, 'Segoe UI', 'PingFang SC', sans-serif; backgr
       <button class="btn btn-call" id="btnCall" onclick="toggleCall()">Start Call</button>
       <div class="vu-meter"><div class="bar" id="vuBar"></div></div>
       <span style="font-size:12px;color:var(--dim)" id="micLabel">Mic off</span>
+      <span style="font-size:11px;color:var(--dim);margin-left:10px;font-family:'SF Mono','Fira Code',monospace" id="bufLabel"></span>
       <span style="flex:1"></span>
       <button class="btn btn-reset" onclick="resetSession()">Reset</button>
     </div>
@@ -185,6 +186,14 @@ body { font-family: -apple-system, 'Segoe UI', 'PingFang SC', sans-serif; backgr
     </div>
 
     <div class="sb">
+      <h3>Network Buffer</h3>
+      <div class="row"><span class="label">Status</span><span class="value" id="bufState">idle</span></div>
+      <div class="row"><span class="label">Buffered</span><span class="value" id="bufLevel">--</span></div>
+      <div class="row"><span class="label">Target</span><span class="value" id="bufTarget">150ms</span></div>
+      <div class="row"><span class="label">Underruns</span><span class="value" id="bufUR">0</span></div>
+    </div>
+
+    <div class="sb">
       <h3>Model Info</h3>
       <div id="modelInfo">
         <div class="row"><span class="label">Model</span><span class="value">MiniCPM-o 4.5 (9B)</span></div>
@@ -205,6 +214,7 @@ var SR_IN = 16000, SR_OUT = 44100, CHUNK = 512;
 var ws = null, mediaStream = null, capCtx = null, workletNode = null;
 var calling = false, agentState = 'idle', ttsPlaying = false;
 var turns = 0, ttfaSum = 0;
+var playableTurn = 0;  // only play audio from this turn
 var PIPELINE_REF = 458;
 var MAX_BAR = 2000;
 
@@ -275,15 +285,17 @@ function connectWS() {
 
   ws.onmessage = function(evt) {
     if (evt.data instanceof ArrayBuffer) {
-      if (!ttsPlaying) return;
-      playAudio(evt.data);
+      if (playableTurn > 0) {
+        ttsPlaying = true;
+        playAudio(evt.data);
+      }
       return;
     }
     var msg = JSON.parse(evt.data);
     switch (msg.type) {
       case 'state':
         setAgentState(msg.state);
-        if (msg.state === 'speaking') ttsPlaying = true;
+        if (msg.state === 'speaking') { ttsPlaying = true; if (playableTurn === 0) playableTurn = 1; }
         if (msg.state === 'idle' || msg.state === 'listening') {
           ttsPlaying = false;
         }
@@ -292,7 +304,9 @@ function connectWS() {
         addMsg('user', '[Audio ' + msg.audio_duration_s.toFixed(1) + 's]', 'captured by VAD');
         break;
       case 'audio_start':
+        playableTurn = msg.turn || 1;
         ttsPlaying = true;
+        if (playerNode) playerNode.port.postMessage('start');
         break;
       case 'response':
         var fa = msg.first_audio_ms || msg.ttfa_ms || 0;
@@ -308,8 +322,10 @@ function connectWS() {
       case 'rag':
         break;
       case 'audio_end':
+        if (playerNode) playerNode.port.postMessage('drain');
         break;
       case 'barge_in':
+        playableTurn = 0;
         addMsg('system', 'Interrupted');
         stopPlayback();
         break;
@@ -317,24 +333,60 @@ function connectWS() {
   };
 }
 
-/* ---- Audio Playback (24 kHz, AudioWorklet queue) ---- */
+/* ---- Audio Playback (44.1 kHz, AudioWorklet + Adaptive Jitter Buffer) ---- */
 var playCtx = null, playerNode = null, playerReady = false;
 
 function initPlayer() {
   if (playerReady) return Promise.resolve();
   playCtx = new AudioContext({ sampleRate: SR_OUT });
-  var code =
-    'class Q extends AudioWorkletProcessor{constructor(){super();this.q=[];this.c=null;this.p=0;' +
-    'this.port.onmessage=function(e){if(e.data==="flush"){this.q=[];this.c=null;this.p=0;return;}' +
-    'this.q.push(new Float32Array(e.data));}.bind(this);}' +
-    'process(i,o){var out=o[0][0];for(var j=0;j<out.length;j++){' +
-    'if(!this.c||this.p>=this.c.length){this.c=this.q.length?this.q.shift():null;this.p=0;}' +
-    'out[j]=this.c?this.c[this.p++]:0;}return true;}}' +
-    'registerProcessor("q",Q);';
+  var code = [
+    'class Q extends AudioWorkletProcessor{',
+    'constructor(){super();var t=this;',
+    't.q=[];t.c=null;t.p=0;t.buf=0;',
+    't.st=0;t.drn=false;',
+    't.tMs=150;t.tgt=Math.round(150*sampleRate/1000);',
+    't.ur=0;t.gd=0;t.fc=0;',
+    't.rep=Math.round(0.2*sampleRate/128);',
+    't.port.onmessage=function(e){',
+    'if(e.data==="flush"){t.q=[];t.c=null;t.p=0;t.buf=0;t.st=0;t.drn=false;',
+    't.port.postMessage({s:0,ms:0,tgt:t.tMs,ur:t.ur});return;}',
+    'if(e.data==="start"){if(t.st===0)t.st=1;t.drn=false;return;}',
+    'if(e.data==="drain"){t.drn=true;if(t.st===1&&t.buf>0)t.st=2;return;}',
+    'var f=new Float32Array(e.data);t.q.push(f);t.buf+=f.length;',
+    '};}',
+    'process(i,o){var out=o[0][0],len=out.length;this.fc++;',
+    'if(this.st===0){for(var j=0;j<len;j++)out[j]=0;return true;}',
+    'if(this.st===1){for(var j=0;j<len;j++)out[j]=0;',
+    'if(this.buf>=this.tgt)this.st=2;this._r();return true;}',
+    'for(var j=0;j<len;j++){if(!this.c||this.p>=this.c.length){',
+    'if(this.q.length){this.c=this.q.shift();this.buf-=this.c.length;this.p=0;}',
+    'else{this.c=null;this.p=0;for(;j<len;j++)out[j]=0;',
+    'if(this.drn){this.st=0;this.drn=false;this.gd++;',
+    'if(this.gd>=3&&this.tMs>50){this.tMs=Math.max(50,this.tMs-25);',
+    'this.tgt=Math.round(this.tMs*sampleRate/1000);this.gd=0;}}',
+    'else{this.ur++;this.gd=0;this.tMs=Math.min(400,this.tMs+50);',
+    'this.tgt=Math.round(this.tMs*sampleRate/1000);}',
+    'this._r();return true;}}out[j]=this.c[this.p++];}this._r();return true;}',
+    '_r(){if(this.fc%this.rep!==0)return;this.port.postMessage(',
+    '{s:this.st,ms:Math.round(this.buf/sampleRate*1000),tgt:this.tMs,ur:this.ur});}',
+    '}registerProcessor("q",Q);'
+  ].join('\n');
   return playCtx.audioWorklet.addModule(
     URL.createObjectURL(new Blob([code], {type: 'application/javascript'}))
   ).then(function() {
     playerNode = new AudioWorkletNode(playCtx, 'q');
+    playerNode.port.onmessage = function(e) {
+      var d = e.data;
+      if (!d || typeof d.s === 'undefined') return;
+      var names = ['idle', 'buffering', 'playing'];
+      $('bufState').textContent = names[d.s] || 'idle';
+      $('bufLevel').textContent = d.ms + 'ms';
+      $('bufTarget').textContent = d.tgt + 'ms';
+      $('bufUR').textContent = d.ur;
+      if (d.s === 1) $('bufLabel').textContent = 'Buf ' + d.ms + '/' + d.tgt + 'ms';
+      else if (d.s === 2) $('bufLabel').textContent = 'Buf ' + d.ms + 'ms';
+      else $('bufLabel').textContent = '';
+    };
     playerNode.connect(playCtx.destination);
     return playCtx.resume();
   }).then(function() { playerReady = true; });
@@ -351,6 +403,7 @@ function playAudio(buffer) {
 function stopPlayback() {
   if (playerNode) playerNode.port.postMessage('flush');
   ttsPlaying = false;
+  $('bufLabel').textContent = '';
 }
 
 /* ---- Microphone Capture ---- */
